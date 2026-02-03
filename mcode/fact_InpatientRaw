@@ -1,0 +1,9 @@
+let
+    Source = src_Book_Inpatient,
+
+    SheetTable = Source{[Kind = "Sheet", Item = "Sheet1"]}[Data],
+
+    PromotedHeaders = Table.PromoteHeaders(SheetTable, [PromoteAllScalars = true]
+    )
+in
+    PromotedHeaders
