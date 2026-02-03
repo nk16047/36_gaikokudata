@@ -1,0 +1,6 @@
+//指定のテーブルを取得（1行目はヘッダ）
+let
+    Source = src_Book_Mapping,
+    TblNationality = Source{[Kind = "Table", Item = "T在院日数"]}[Data]
+in
+    TblNationality
