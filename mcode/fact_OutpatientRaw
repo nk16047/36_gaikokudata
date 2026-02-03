@@ -1,0 +1,10 @@
+let
+    Source = src_Book_Outpatient,
+
+    // Sheet1 の行だけ拾う
+    Sheet1 = Source{[Kind = "Sheet", Item = "Sheet1"]}[Data],
+
+    // 1行目をヘッダに昇格
+    PromotedHeaders = Table.PromoteHeaders(Sheet1, [PromoteAllScalars = true])
+in
+    PromotedHeaders
