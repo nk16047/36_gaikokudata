@@ -1,0 +1,244 @@
+let
+    // 0) 外来の生データ（fact_OutpatientRaw）からスタート
+    Source =
+        fact_OutpatientRaw,
+
+    // 1) 外来受診年 = YEAR(外来受診日)
+    AddedVisitYear =
+        Table.AddColumn(
+            Source,
+            "外来受診年",
+            each
+                if [外来受診日] = null then
+                    null
+                else
+                    Date.Year(
+                        Date.From([外来受診日])
+                    ),
+            Int64.Type
+        ),
+
+    // 2) 年齢 = DATEDIF(生年月日, 外来受診日, "Y") 相当
+    AddedAge =
+        Table.AddColumn(
+            AddedVisitYear,
+            "年齢",
+            each
+                let
+                    dob   = [生年月日],
+                    visit = [外来受診日]
+                in
+                    // どちらかが null なら null
+                    if dob = null or visit = null then
+                        null
+                    else
+                        let
+                            vDate = Date.From(visit),
+                            bDate = Date.From(dob),
+
+                            // 年の差だけ先に出す
+                            baseYears =
+                                Date.Year(vDate) - Date.Year(bDate),
+
+                            // 今年の誕生日の日付
+                            birthdayThisYear =
+                                #date(
+                                    Date.Year(vDate),
+                                    Date.Month(bDate),
+                                    Date.Day(bDate)
+                                ),
+
+                            // 誕生日がまだ来ていなければ -1
+                            age =
+                                if vDate < birthdayThisYear then
+                                    baseYears - 1
+                                else
+                                    baseYears
+                        in
+                            age,
+            Int64.Type
+        ),
+
+    // 3) 初診フラグ = IF(外来受診日 = 初回外来受診日, "初診", "その他")
+    AddedFirstVisitFlag =
+        Table.AddColumn(
+            AddedAge,
+            "初診",
+            each
+                if [外来受診日] = [初回外来受診日] then
+                    "初診"
+                else
+                    "その他",
+            type text
+        ),
+
+    // 4) 年齢階級マスタ(dim_AgeClass)との結合
+    //    キーは「年齢」同士
+    JoinedAgeClass =
+        Table.NestedJoin(
+            AddedFirstVisitFlag,   // 左側テーブル（外来）
+            {"年齢"},              // 左側のキー列（リストで指定）
+            dim_AgeClass,          // 右側テーブル（年齢階級マスタ）
+            {"年齢"},              // 右側のキー列
+            "AgeClassTable",       // 結合結果を入れる列名
+            JoinKind.LeftOuter     // 左外部結合＝外来は全件残す
+        ),
+
+    // 5) 結合してできた AgeClassTable 列を展開して「年齢階級」だけ出す
+    ExpandedAgeClass =
+        Table.ExpandTableColumn(
+            JoinedAgeClass,   // 元のテーブル
+            "AgeClassTable",  // 展開する列（Table型）
+            {"階級"},         // 展開したい列名（右側テーブル内の列）
+            {"年齢階級"}      // 展開後の列名
+        ),
+
+    // 5) 国籍マスタ
+    JoinedNationality =
+        Table.NestedJoin(
+            ExpandedAgeClass,      // 左側：外来
+            {"国籍区分"},          // 左側キー
+            dim_Nationality,       // 右側：国籍マスタ
+            {"国籍区分"},          // 右側キー
+            "NationalityTable",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedNationality =
+        Table.ExpandTableColumn(
+            JoinedNationality,
+            "NationalityTable",
+            {"国籍名"},
+            {"国籍名"}
+        ),
+
+    // 6) 言語マスタ（第1段階：言語コード→言語名）
+    JoinedLanguageByCode =
+        Table.NestedJoin(
+            ExpandedNationality,   // 左側：外来
+            {"言語"},              // 言語コード列
+            dim_Language,
+            {"言語"},
+            "LanguageTable",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedLanguageByCode =
+        Table.ExpandTableColumn(
+            JoinedLanguageByCode,
+            "LanguageTable",
+            {"言語名"},
+            {"言語名"}
+        ),
+
+    // ── ここから【第2段階：T国籍言語（dim_NationalityLang）を使った補完】──
+
+    // 1) 国籍名をキーに dim_NationalityLang を結合
+    JoinedLangByNationality =
+        Table.NestedJoin(
+            ExpandedLanguageByCode,   // 言語コードJOIN済みのテーブル
+            {"国籍名"},               // 外来側キー
+            dim_NationalityLang,      // T国籍言語 由来の dim
+            {"国籍名"},               // dim側キー
+            "NatLangTable",           // 結合結果が入る列
+            JoinKind.LeftOuter
+        ),
+
+    // 2) 「国籍言語名」だけ展開（代表言語）
+    ExpandedLangByNationality =
+        Table.ExpandTableColumn(
+            JoinedLangByNationality,
+            "NatLangTable",
+            {"国籍言語名"},
+            {"国籍言語名"}
+        ),
+
+    // 3) 言語名が null の行だけ、国籍言語名 で補完
+    AddedLanguageCompleted =
+        Table.AddColumn(
+            ExpandedLangByNationality,
+            "言語名_補完",
+            each
+                if [言語名] <> null then
+                    [言語名]
+                else
+                    [国籍言語名],
+            type text
+        ),
+
+    // 4) 作業列を整理して、最終的な「言語名」に一本化
+    RemovedTempLanguageColumns =
+        Table.RemoveColumns(
+            AddedLanguageCompleted,
+            {"言語名", "国籍言語名"}
+        ),
+
+    LangCompleted =
+        Table.RenameColumns(
+            RemovedTempLanguageColumns,
+            {{"言語名_補完", "言語名"}}
+        ),
+
+    // 90) Power BI スライサー用の列をまとめて追加
+    AddPowerBISlicerColumns =
+        let
+            // 外来受診月（1〜12）
+            t1 =
+                Table.AddColumn(
+                    LangCompleted,    // ★ 入院と同じく、補完後のテーブルを使う
+                    "外来受診月",
+                    each
+                        if [外来受診日] = null then
+                            null
+                        else
+                            Date.Month(Date.From([外来受診日])),
+                    Int64.Type
+                ),
+
+            // 外来受診四半期
+            t2 =
+                Table.AddColumn(
+                    t1,
+                    "外来受診四半期",
+                    each
+                        if [外来受診日] = null then
+                            null
+                        else
+                            "Q" &
+                            Number.ToText(
+                                Date.QuarterOfYear(
+                                    Date.From([外来受診日])
+                                )
+                            ),
+                    type text
+                )
+        in
+            t2, 
+
+    // 99) 型をまとめてそろえる（最終ステップ）
+    FinalTypes =
+        Table.TransformColumnTypes(
+            AddPowerBISlicerColumns,
+            {
+                {"外来受診日",         type date},
+                {"外来受診年",         Int64.Type},
+                {"外来受診月",         Int64.Type},               
+                {"外来受診四半期",     type text},
+                {"生年月日",　　　　   type date},   
+                {"初回外来受診日",　　　type date},                   
+                             
+
+                {"年齢",               Int64.Type},
+                {"年齢階級",           type text},
+                {"初診",               type text},
+
+                {"患者番号",           type text},
+                {"科コード",           type text},
+                {"科名",               type text},
+
+                {"国籍名",             type text},
+                {"言語名",             type text}
+            }
+        )
+in
+    FinalTypes
