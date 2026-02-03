@@ -1,0 +1,170 @@
+let
+    // ① 元データそのまま
+    Source = fact_InterpreterRaw,
+
+    // ② 部署名をキーに、変換リスト（dim_InterpreterDeptRaw）を結合
+    Merged =
+        Table.NestedJoin(
+            Source,
+            {"部署名"},
+            dim_InterpreterDeptRaw,
+            {"部署名"},
+            "DeptMap",
+            JoinKind.LeftOuter
+        ),
+
+    // ③ DeptMap から「科・部署」だけ展開（仮の列名：部署_変換）
+    Expanded =
+        Table.ExpandTableColumn(
+            Merged,
+            "DeptMap",
+            {"科・部署"},
+            {"部署_変換"}
+        ),
+
+    // ④ 「部署」が空 or null のときだけ、「部署_変換」で補完した最終列を作る
+    AddedFinalDept =
+        Table.AddColumn(
+            Expanded,
+            "部署_最終",
+            each
+                let
+                    // 元データの部署（nullも空文字もまとめて扱いたいので文字列化＋Trim）
+                    orig =
+                        let
+                            t = try Text.From([部署]) otherwise ""
+                        in
+                            Text.Trim(t),
+
+                    // 変換リストからの部署（科・部署）
+                    conv =
+                        let
+                            t = try Text.From([部署_変換]) otherwise ""
+                        in
+                            Text.Trim(t)
+                in
+                    if orig <> "" then
+                        orig      // 既に人が整えた部署を優先
+                    else
+                        conv      // 空欄だけマスタから補完
+            ,
+            type text
+        ),
+
+    // ⑤ 古い「部署」と「部署_変換」はもう不要なので消す
+    RemovedTemp =
+        Table.RemoveColumns(
+            AddedFinalDept,
+            {"部署", "部署_変換"}
+        ),
+
+    // ⑥ 「部署_最終」を正式な「部署」にリネーム
+    Renamed =
+        Table.RenameColumns(
+            RemovedTemp,
+            {{"部署_最終", "部署"}}
+        ),
+
+    // ⑦ 着信日_変換 = テキストの日付を Date 型にしたもの
+    //     - [着信日] が null → null
+    //     - 日付に変換できない形式 → null
+    AddedCallDateConv =
+        Table.AddColumn(
+            Renamed,
+            "着信日_変換",
+            each
+                let
+                    v = [着信日],
+                    r = try Date.From(v)
+                in
+                    if v = null or r[HasError] then
+                        null
+                    else
+                        r[Value],
+            type date
+        ),
+
+    // ⑧ 着信月 = 着信日_変換 の月（1〜12）
+    //     既に「着信月」列がある場合は上書き、ない場合は新規追加
+    AddedOrReplacedCallMonth =
+        if Table.HasColumns(AddedCallDateConv, "着信月") then
+            Table.TransformColumns(
+                AddedCallDateConv,
+                {
+                    {
+                        "着信月",
+                        each
+                            if [着信日_変換] = null then
+                                null
+                            else
+                                Date.Month([着信日_変換]),
+                        Int64.Type
+                    }
+                }
+            )
+        else
+            Table.AddColumn(
+                AddedCallDateConv,
+                "着信月",
+                each
+                    if [着信日_変換] = null then
+                        null
+                    else
+                        Date.Month([着信日_変換]),
+                Int64.Type
+            ),
+
+    // ⑨ 曜日 = 着信日_変換 から曜日名（"月","火",…）
+    //     こちらも同じく、既存なら上書き・なければ追加
+    AddedOrReplacedWeekday =
+        if Table.HasColumns(AddedOrReplacedCallMonth, "曜日") then
+            Table.TransformColumns(
+                AddedOrReplacedCallMonth,
+                {
+                    {
+                        "曜日",
+                        each
+                            if [着信日_変換] = null then
+                                null
+                            else
+                                let
+                                    fullName =
+                                        Date.DayOfWeekName(
+                                            [着信日_変換],
+                                            "ja-JP"
+                                        )
+                                in
+                                    Text.Start(fullName, 1),
+                        type text
+                    }
+                }
+            )
+        else
+            Table.AddColumn(
+                AddedOrReplacedCallMonth,
+                "曜日",
+                each
+                    if [着信日_変換] = null then
+                        null
+                    else
+                        let
+                            fullName =
+                                Date.DayOfWeekName(
+                                    [着信日_変換],
+                                    "ja-JP"
+                                )
+                        in
+                            Text.Start(fullName, 1),
+                type text
+            ),
+
+    // ⑩ おまけ：1行=1件なので件数列を追加
+    AddedCount =
+        Table.AddColumn(
+            AddedOrReplacedWeekday,
+            "件数",
+            each 1,
+            Int64.Type
+        )
+in
+    AddedCount
