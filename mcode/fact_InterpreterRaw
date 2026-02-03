@@ -1,0 +1,6 @@
+let
+    Source = src_Book_Interpreter,
+    元データ = Source{[Kind = "Sheet", Item = "元データ"]}[Data],
+    PromotedHeaders = Table.PromoteHeaders(元データ, [PromoteAllScalars = true])
+in
+    PromotedHeaders
