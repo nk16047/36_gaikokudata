@@ -1,0 +1,307 @@
+let
+    // 0) 入院の生データ
+    Source =
+        fact_InpatientRaw,
+
+    // 1) 入院年 = YEAR(入院日)
+    AddedAdmYear =
+        Table.AddColumn(
+            Source,
+            "入院年",
+            each
+                if [入院日] = null then
+                    null
+                else
+                    Date.Year(
+                        Date.From([入院日])
+                    ),
+            Int64.Type
+        ),
+
+    // 2) 年齢 = DATEDIF(生年月日, 入院日, "Y") 相当
+    AddedAge =
+        Table.AddColumn(
+            AddedAdmYear,
+            "年齢",
+            each
+                let
+                    dob = [生年月日],
+                    adm = [入院日]
+                in
+                    // 生年月日 or 入院日 が null なら null
+                    if dob = null or adm = null then
+                        null
+                    else
+                        let
+                            aDate = Date.From(adm),
+                            bDate = Date.From(dob),
+
+                            // 年の差だけ先に出す（ざっくり）
+                            baseYears =
+                                Date.Year(aDate) - Date.Year(bDate),
+
+                            // 今年の誕生日
+                            birthdayThisYear =
+                                #date(
+                                    Date.Year(aDate),
+                                    Date.Month(bDate),
+                                    Date.Day(bDate)
+                                ),
+
+                            // 誕生日がまだ来ていなければ -1 する
+                            age =
+                                if aDate < birthdayThisYear then
+                                    baseYears - 1
+                                else
+                                    baseYears
+                        in
+                            age,
+            Int64.Type
+        ),
+
+    // 2.5) 在院日数 = DATEDIF(入院日, 退院日, "D") + 1 相当（両方そろっている行だけ）
+    AddedStayDays =
+        Table.AddColumn(
+            AddedAge,
+            "在院日数",
+            each
+                let
+                    adm = [入院日],
+                    dis = [退院日]
+                in
+                    // 入院日 or 退院日 のどちらかでも null なら在院日数は計算しない
+                    if adm = null or dis = null then
+                        null
+                    else
+                        // 退院日 − 入院日 の日数差に +1（日数としてカウント）
+                        Duration.Days(
+                            Date.From(dis) - Date.From(adm)
+                        ) + 1,
+            Int64.Type
+        ),
+
+    // 2.6) 在院日数マスタ（T在院日数）を JOIN して在院区分を取得
+    //      ※ dim_StayDays は「在院日数」「在院区分」を持つテーブル想定
+    JoinedStayClass =
+        Table.NestedJoin(
+            AddedStayDays,       // 左側：入院
+            {"在院日数"},        // 左側キー
+            dim_StayDays,        // 右側：T在院日数由来の dim
+            {"在院日数"},        // 右側キー
+            "StayTable",         // ネストテーブル列名
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedStayClass =
+        Table.ExpandTableColumn(
+            JoinedStayClass,
+            "StayTable",
+            {"在院区分"},
+            {"在院区分_tmp"}
+        ),
+
+    // 2.7) 退院日が null の行は「入院中」として扱う
+    //      それ以外はマスタから持ってきた在院区分を使う
+    AddedStayClassFinal =
+        Table.AddColumn(
+            ExpandedStayClass,
+            "在院区分",
+            each
+                if [退院日] = null then
+                    "入院中"
+                else
+                    [在院区分_tmp],
+            type text
+        ),
+
+    RemovedStayTmp =
+        Table.RemoveColumns(
+            AddedStayClassFinal,
+            {"在院区分_tmp"}
+        ),
+
+    // 3) 初入院フラグ = IF(入院日 = 初回入院受診日, "初入院", "その他")
+    AddedFirstAdmFlag =
+        Table.AddColumn(
+            RemovedStayTmp,
+            "初入院",
+            each
+                if [入院日] = [初回入院受診日] then
+                    "初入院"
+                else
+                    "その他",
+            type text
+        ),
+
+    // 4) 年齢階級マスタ
+    //    キーは「年齢」同士
+    JoinedAgeClass =
+        Table.NestedJoin(
+            AddedFirstAdmFlag,    // 左側テーブル（入院）
+            {"年齢"},             // 左側キー列（リストで指定）
+            dim_AgeClass,         // 右側テーブル（年齢階級マスタ）
+            {"年齢"},             // 右側キー列（実際の列名に合わせてね）
+            "AgeClassTable",      // 右側テーブルが入る列名
+            JoinKind.LeftOuter    // 左外部結合＝入院側は全件残す
+        ),
+
+    // 5) 結合してできた AgeClassTable 列を展開して「年齢階級」だけ出す
+    ExpandedAgeClass =
+        Table.ExpandTableColumn(
+            JoinedAgeClass,       // 元テーブル
+            "AgeClassTable",      // 展開する列（Table型）
+            {"階級"},             // 右側テーブルから取り出したい列
+            {"年齢階級"}          // 展開後の列名
+        ),
+
+    // 5) 国籍 JOIN
+    JoinedNationality =
+        Table.NestedJoin(
+            ExpandedAgeClass,      // 左側：入院
+            {"国籍区分"},          // 左側キー
+            dim_Nationality,       // 右側：国籍マスタ
+            {"国籍区分"},          // 右側キー
+            "NationalityTable",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedNationality =
+        Table.ExpandTableColumn(
+            JoinedNationality,
+            "NationalityTable",
+            {"国籍名"},
+            {"国籍名"}
+        ),
+
+    // 6) 言語マスタ(dim_Language) — 第1段階：言語コードから言語名
+    JoinedLanguageByCode =
+        Table.NestedJoin(
+            ExpandedNationality,   // 左側：入院
+            {"言語"},              // 入院側の「言語」列
+            dim_Language,          // 右側：言語マスタ
+            {"言語"},              // マスタ側の「言語」列
+            "LanguageTableByCode",
+            JoinKind.LeftOuter
+        ),
+
+    // 7) 「言語名」だけ展開（この時点ではコード由来の言語名だけ）
+    ExpandedLanguageByCode =
+        Table.ExpandTableColumn(
+            JoinedLanguageByCode,
+            "LanguageTableByCode",
+            {"言語名"},
+            {"言語名"}
+        ),
+
+    // 7.5) ★ 第2段階：T国籍言語(dim_NationalityLang)による代表言語の補完
+    //      言語名が null の行だけ、国籍名から「国籍言語名」で埋める
+
+    JoinedLangByNationality =
+        Table.NestedJoin(
+            ExpandedLanguageByCode,   // 第1段階まで終わったテーブル
+            {"国籍名"},               // 入院側キー
+            dim_NationalityLang,      // T国籍言語から作った dim
+            {"国籍名"},               // dim側キー
+            "NatLangTable",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedLangByNationality =
+        Table.ExpandTableColumn(
+            JoinedLangByNationality,
+            "NatLangTable",
+            {"国籍言語名"},
+            {"国籍言語名"}
+        ),
+
+    AddedLanguageCompleted =
+        Table.AddColumn(
+            ExpandedLangByNationality,
+            "言語名_補完",
+            each
+                if [言語名] <> null then
+                    [言語名]
+                else
+                    [国籍言語名],
+            type text
+        ),
+
+    LangCompleted =
+        Table.RenameColumns(
+            Table.RemoveColumns(
+                AddedLanguageCompleted,
+                {"言語名", "国籍言語名"}
+            ),
+            {{"言語名_補完", "言語名"}}
+        ),
+
+    // 90) Power BI スライサー用の列をまとめて追加
+    AddPowerBISlicerColumns =
+        let
+            // 入院月（1〜12）
+            t1 =
+                Table.AddColumn(
+                    LangCompleted,
+                    "入院月",
+                    each
+                        if [入院日] = null then
+                            null
+                        else
+                            Date.Month(
+                                Date.From([入院日])
+                            ),
+                    Int64.Type
+                ),
+
+            // 入院四半期（"Q1"〜"Q4"）
+            t2 =
+                Table.AddColumn(
+                    t1,
+                    "入院四半期",
+                    each
+                        if [入院日] = null then
+                            null
+                        else
+                            "Q" &
+                            Number.ToText(
+                                Date.QuarterOfYear(
+                                    Date.From([入院日])
+                                )
+                            ),
+                    type text
+                )
+        in
+            t2,
+
+    // 99) 最終的な型そろえ
+    FinalTypes =
+        Table.TransformColumnTypes(
+            AddPowerBISlicerColumns,
+            {
+                // 日付まわり
+                {"入院日",          type date},
+                {"入院年",          Int64.Type},
+                {"入院月",          Int64.Type},
+                {"入院四半期",      type text},
+                {"生年月日",        type date},
+                {"初回入院受診日",   type date},
+                {"退院日",          type date},
+
+                // 年齢・在院まわり
+                {"年齢",            Int64.Type},
+                {"年齢階級",        type text},
+                {"初入院",          type text},
+                {"在院日数",        Int64.Type},
+                {"在院区分",        type text},
+
+                // キー・診療科
+                {"患者番号",        type text},
+                {"科名",            type text},
+
+                // 多文化系
+                {"国籍名",          type text},
+                {"言語名",          type text}
+            }
+        )
+in
+    FinalTypes
